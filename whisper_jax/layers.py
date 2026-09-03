@@ -40,7 +40,7 @@ with_sharding_constraint = nn_partitioning.with_sharding_constraint
 Array = jnp.ndarray
 DType = jnp.dtype
 PRNGKey = jnp.ndarray
-Shape = Iterable[int]
+Shape = Sequence[int]
 Activation = Callable[..., Array]
 PrecisionLike = Union[None, str, lax.Precision, Tuple[str, str], Tuple[lax.Precision, lax.Precision]]
 DotGeneralT = Callable[..., Array]
@@ -60,7 +60,7 @@ default_embed_init = nn.initializers.variance_scaling(1.0, "fan_in", "normal", o
 # Temporary inlined JAX N-d initializer code
 # TODO(levskaya): remove once new JAX release is out.
 # ------------------------------------------------------------------------------
-def _compute_fans(shape: jax.core.NamedShape, in_axis=-2, out_axis=-1):
+def _compute_fans(shape: Shape, in_axis=-2, out_axis=-1):
     """Inlined JAX `nn.initializer._compute_fans`."""
     if isinstance(in_axis, int):
         in_size = shape[in_axis]
@@ -70,7 +70,7 @@ def _compute_fans(shape: jax.core.NamedShape, in_axis=-2, out_axis=-1):
         out_size = shape[out_axis]
     else:
         out_size = int(np.prod([shape[i] for i in out_axis]))
-    receptive_field_size = shape.total / in_size / out_size
+    receptive_field_size = np.prod(shape) / in_size / out_size
     fan_in = in_size * receptive_field_size
     fan_out = out_size * receptive_field_size
     return fan_in, fan_out
@@ -82,7 +82,7 @@ def variance_scaling(scale, mode, distribution, in_axis=-2, out_axis=-1, dtype=j
     def init(key, shape, dtype=dtype):
         return jnp.zeros(shape, dtype=dtype)
         dtype = jax.dtypes.canonicalize_dtype(dtype)
-        shape = jax.core.as_named_shape(shape)
+        shape = tuple(shape)
         fan_in, fan_out = _compute_fans(shape, in_axis, out_axis)
         if mode == "fan_in":
             denominator = fan_in

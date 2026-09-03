@@ -17,8 +17,9 @@ The Whisper JAX model is also running as a demo on the Hugging Face Hub:
 
 ## Installation
 
-Whisper JAX was tested using Python 3.9 and JAX version 0.4.5. Installation assumes that you already have the latest 
-version of the JAX package installed on your device. You can do so using the official JAX installation guide: https://github.com/google/jax#installation
+Whisper JAX requires Python 3.12 or newer and is tested with JAX 0.8.2. JAX is installed as a package dependency.
+Accelerator users can install the appropriate JAX distribution first by following the official JAX installation guide:
+https://docs.jax.dev/en/latest/installation.html
 
 Once the appropriate version of JAX has been installed, Whisper JAX can be installed through pip:
 ```

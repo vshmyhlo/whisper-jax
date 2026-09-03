@@ -22,8 +22,9 @@ from setuptools import find_packages, setup
 
 
 _deps = [
-    "transformers>=4.27.4,<4.35.0",
-    "flax",
+    "jax==0.8.2",
+    "transformers>=4.57.1,<5",
+    "flax==0.12.6",
     "cached-property",
 ]
 
@@ -60,6 +61,11 @@ setup(
     description="JAX implementation of OpenAI's Whisper model.",
     long_description=long_description,
     long_description_content_type="text/markdown",
+    python_requires=">=3.12",
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.12",
+    ],
     packages=find_packages(),
     install_requires=_deps,
     extras_require={
