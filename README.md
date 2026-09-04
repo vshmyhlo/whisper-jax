@@ -67,6 +67,21 @@ import jax.numpy as jnp
 pipeline = FlaxWhisperPipline("openai/whisper-large-v2", dtype=jnp.bfloat16)
 ```
 
+On supported NVIDIA GPUs, JAX's cuDNN Flash Attention implementation can be enabled explicitly:
+
+```python
+pipeline = FlaxWhisperPipline(
+    "openai/whisper-large-v2",
+    dtype=jnp.bfloat16,
+    attention_backend="cudnn",
+)
+```
+
+The default attention implementation remains unchanged. The model also falls back to it when attention weights are
+requested or when attention dropout is active during training. The `"cudnn"` backend requires `jnp.float16` or
+`jnp.bfloat16` computation and an NVIDIA CUDA-enabled JAX installation. Unsupported cuDNN shapes raise an error during
+compilation.
+
 ### Batching
 Whisper JAX also provides the option of _batching_ a single audio input across accelerator devices. The audio is first 
 chunked into 30 second segments, and then chunks dispatched to the model to be transcribed in parallel. The resulting 

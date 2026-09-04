@@ -63,6 +63,17 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "openai/whisper-tiny"
 _CONFIG_FOR_DOC = "WhisperConfig"
+_ATTENTION_BACKENDS = ("default", "cudnn")
+_CUDNN_ATTENTION_DTYPES = (jnp.dtype(jnp.float16), jnp.dtype(jnp.bfloat16))
+
+
+def _validate_attention_backend(attention_backend: str, dtype: jnp.dtype) -> None:
+    if attention_backend not in _ATTENTION_BACKENDS:
+        raise ValueError(f"Unsupported attention backend {attention_backend!r}. Expected one of: 'default', 'cudnn'.")
+    if attention_backend == "cudnn" and jnp.dtype(dtype) not in _CUDNN_ATTENTION_DTYPES:
+        raise ValueError(
+            f'`attention_backend="cudnn"` requires `dtype=jnp.float16` or `dtype=jnp.bfloat16`, got {dtype}.'
+        )
 
 
 WHISPER_START_DOCSTRING = r"""
@@ -88,6 +99,10 @@ WHISPER_START_DOCSTRING = r"""
             **Note that this only specifies the dtype of the computation and does not influence the dtype of model
             parameters.** If you wish to change the dtype of the model parameters, see [`~FlaxPreTrainedModel.to_fp16`]
             and [`~FlaxPreTrainedModel.to_bf16`].
+        attention_backend (`str`, *optional*, defaults to `"default"`):
+            Attention implementation to use. Set to `"cudnn"` to opt into JAX's cuDNN Flash Attention backend on
+            supported NVIDIA GPUs using `jax.numpy.float16` or `jax.numpy.bfloat16` computation. Requests for attention
+            weights and training with attention dropout use the default implementation.
 """
 
 WHISPER_INPUTS_DOCSTRING = r"""
@@ -244,8 +259,11 @@ class FlaxWhisperAttention(nn.Module):
     bias: bool = True
     dtype: jnp.dtype = jnp.float32
     params_dtype: jnp.dtype = jnp.float32
+    attention_backend: str = "default"
 
     def setup(self) -> None:
+        _validate_attention_backend(self.attention_backend, self.dtype)
+
         self.head_dim = self.embed_dim // self.num_heads
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -287,7 +305,8 @@ class FlaxWhisperAttention(nn.Module):
         attention_mask: Optional[jnp.ndarray] = None,
         init_cache: bool = False,
         deterministic: bool = True,
-    ) -> Tuple[jnp.ndarray]:
+        output_attentions: bool = True,
+    ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
         is_cross_attention = key_value_states is not None
         batch_size = hidden_states.shape[0]
 
@@ -340,34 +359,52 @@ class FlaxWhisperAttention(nn.Module):
                 key_states, value_states, query_states, attention_mask
             )
 
-        # Convert the boolean attention mask to an attention bias.
-        if attention_mask is not None:
-            # attention mask in the form of attention bias
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
-            )
-        else:
-            attention_bias = None
-
-        dropout_rng = None
-        if not deterministic and self.dropout > 0.0:
-            dropout_rng = self.make_rng("dropout")
-
-        attn_weights = dot_product_attention_weights(
-            query_states,
-            key_states,
-            bias=attention_bias,
-            dropout_rng=dropout_rng,
-            dropout_rate=self.dropout,
-            broadcast_dropout=True,
-            deterministic=deterministic,
-            dtype=self.dtype,
-            precision=None,
+        use_cudnn_attention = (
+            self.attention_backend == "cudnn" and not output_attentions and (deterministic or self.dropout == 0.0)
         )
+        if use_cudnn_attention:
+            boolean_attention_mask = None
+            if attention_mask is not None:
+                boolean_attention_mask = jnp.broadcast_to(
+                    attention_mask > 0,
+                    attention_mask.shape[:-2] + (query_states.shape[1], key_states.shape[1]),
+                )
+            attn_output = jax.nn.dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                mask=boolean_attention_mask,
+                implementation="cudnn",
+            )
+            attn_weights = None
+        else:
+            # Convert the boolean attention mask to an attention bias.
+            if attention_mask is not None:
+                attention_bias = lax.select(
+                    attention_mask > 0,
+                    jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
+                    jnp.full(attention_mask.shape, jnp.finfo(self.dtype).min).astype(self.dtype),
+                )
+            else:
+                attention_bias = None
 
-        attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
+            dropout_rng = None
+            if not deterministic and self.dropout > 0.0:
+                dropout_rng = self.make_rng("dropout")
+
+            attn_weights = dot_product_attention_weights(
+                query_states,
+                key_states,
+                bias=attention_bias,
+                dropout_rng=dropout_rng,
+                dropout_rate=self.dropout,
+                broadcast_dropout=True,
+                deterministic=deterministic,
+                dtype=self.dtype,
+                precision=None,
+            )
+
+            attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
         attn_output = self._merge_heads(attn_output)
         attn_output = self.out_proj(attn_output)
 
@@ -456,6 +493,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
     config: WhisperConfig
     dtype: jnp.dtype = jnp.float32
     params_dtype: jnp.dtype = jnp.float32
+    attention_backend: str = "default"
 
     def setup(self) -> None:
         self.embed_dim = self.config.d_model
@@ -464,6 +502,7 @@ class FlaxWhisperEncoderLayer(nn.Module):
             embed_dim=self.embed_dim,
             num_heads=self.config.encoder_attention_heads,
             dropout=self.config.attention_dropout,
+            attention_backend=self.attention_backend,
             dtype=self.dtype,
             params_dtype=self.params_dtype,
         )
@@ -499,7 +538,12 @@ class FlaxWhisperEncoderLayer(nn.Module):
         layernorm_output = self.self_attn_layer_norm(hidden_states)
         layernorm_output = with_sharding_constraint(layernorm_output, ("batch", "length", "embed"))
 
-        attn_output, attn_weights = self.self_attn(hidden_states=layernorm_output, attention_mask=attention_mask)
+        attn_output, attn_weights = self.self_attn(
+            hidden_states=layernorm_output,
+            attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            deterministic=deterministic,
+        )
         attn_output = self.dropout_layer(attn_output, deterministic=deterministic)
         attn_output = residual + attn_output
         attn_output = with_sharding_constraint(attn_output, ("batch", "length", "embed"))
@@ -531,10 +575,17 @@ class FlaxWhisperEncoderLayerCollection(nn.Module):
     config: WhisperConfig
     dtype: jnp.dtype = jnp.float32  # the dtype of the computation
     params_dtype: jnp.dtype = jnp.float32
+    attention_backend: str = "default"
 
     def setup(self):
         self.layers = [
-            FlaxWhisperEncoderLayer(self.config, name=str(i), dtype=self.dtype, params_dtype=self.params_dtype)
+            FlaxWhisperEncoderLayer(
+                self.config,
+                attention_backend=self.attention_backend,
+                name=str(i),
+                dtype=self.dtype,
+                params_dtype=self.params_dtype,
+            )
             for i in range(self.config.encoder_layers)
         ]
         self.layerdrop = self.config.encoder_layerdrop
@@ -587,6 +638,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
     config: WhisperConfig
     dtype: jnp.dtype = jnp.float32
     params_dtype: jnp.dtype = jnp.float32
+    attention_backend: str = "default"
 
     def setup(self) -> None:
         self.embed_dim = self.config.d_model
@@ -596,6 +648,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
             num_heads=self.config.decoder_attention_heads,
             dropout=self.config.attention_dropout,
             causal=True,
+            attention_backend=self.attention_backend,
             dtype=self.dtype,
             params_dtype=self.params_dtype,
         )
@@ -609,6 +662,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
             embed_dim=self.embed_dim,
             num_heads=self.config.decoder_attention_heads,
             dropout=self.config.attention_dropout,
+            attention_backend=self.attention_backend,
             dtype=self.dtype,
             params_dtype=self.params_dtype,
         )
@@ -648,7 +702,11 @@ class FlaxWhisperDecoderLayer(nn.Module):
 
         # Self Attention
         self_attn_output, self_attn_weights = self.self_attn(
-            hidden_states=layer_norm_output, attention_mask=attention_mask, init_cache=init_cache
+            hidden_states=layer_norm_output,
+            attention_mask=attention_mask,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            deterministic=deterministic,
         )
         self_attn_output = self.dropout_layer(self_attn_output, deterministic=deterministic)
         self_attn_output = residual + self_attn_output
@@ -668,6 +726,8 @@ class FlaxWhisperDecoderLayer(nn.Module):
                 hidden_states=encoder_layer_norm_output,
                 key_value_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
+                output_attentions=output_attentions,
+                deterministic=deterministic,
             )
             cross_attn_output = self.dropout_layer(cross_attn_output, deterministic=deterministic)
             cross_attn_output = residual + cross_attn_output
@@ -701,10 +761,17 @@ class FlaxWhisperDecoderLayerCollection(nn.Module):
     config: WhisperConfig
     dtype: jnp.dtype = jnp.float32  # the dtype of the computation
     params_dtype: jnp.dtype = jnp.float32
+    attention_backend: str = "default"
 
     def setup(self):
         self.layers = [
-            FlaxWhisperDecoderLayer(self.config, name=str(i), dtype=self.dtype, params_dtype=self.params_dtype)
+            FlaxWhisperDecoderLayer(
+                self.config,
+                attention_backend=self.attention_backend,
+                name=str(i),
+                dtype=self.dtype,
+                params_dtype=self.params_dtype,
+            )
             for i in range(self.config.decoder_layers)
         ]
         self.layerdrop = self.config.decoder_layerdrop
@@ -772,6 +839,7 @@ class FlaxWhisperEncoder(nn.Module):
     config: WhisperConfig
     dtype: jnp.dtype = jnp.float32
     params_dtype: jnp.dtype = jnp.float32
+    attention_backend: str = "default"
 
     def setup(self) -> None:
         self.conv1 = layers.Conv(
@@ -796,6 +864,7 @@ class FlaxWhisperEncoder(nn.Module):
 
         self.layers = FlaxWhisperEncoderLayerCollection(
             self.config,
+            attention_backend=self.attention_backend,
             dtype=self.dtype,
             params_dtype=self.params_dtype,
         )
@@ -864,6 +933,7 @@ class FlaxWhisperDecoder(nn.Module):
     config: WhisperConfig
     dtype: jnp.dtype = jnp.float32
     params_dtype: jnp.dtype = jnp.float32
+    attention_backend: str = "default"
 
     def setup(self) -> None:
         self.embed_tokens = layers.Embed(
@@ -873,7 +943,12 @@ class FlaxWhisperDecoder(nn.Module):
             self.config.max_target_positions, self.config.d_model, dtype=self.dtype, params_dtype=self.params_dtype
         )
 
-        self.layers = FlaxWhisperDecoderLayerCollection(self.config, dtype=self.dtype, params_dtype=self.params_dtype)
+        self.layers = FlaxWhisperDecoderLayerCollection(
+            self.config,
+            attention_backend=self.attention_backend,
+            dtype=self.dtype,
+            params_dtype=self.params_dtype,
+        )
 
         self.dropout_layer = nn.Dropout(rate=self.config.dropout)
 
@@ -933,10 +1008,21 @@ class FlaxWhisperModule(nn.Module):
     config: WhisperConfig
     dtype: jnp.dtype = jnp.float32
     params_dtype: jnp.dtype = jnp.float32
+    attention_backend: str = "default"
 
     def setup(self) -> None:
-        self.encoder = FlaxWhisperEncoder(self.config, dtype=self.dtype, params_dtype=self.params_dtype)
-        self.decoder = FlaxWhisperDecoder(self.config, dtype=self.dtype, params_dtype=self.params_dtype)
+        self.encoder = FlaxWhisperEncoder(
+            self.config,
+            attention_backend=self.attention_backend,
+            dtype=self.dtype,
+            params_dtype=self.params_dtype,
+        )
+        self.decoder = FlaxWhisperDecoder(
+            self.config,
+            attention_backend=self.attention_backend,
+            dtype=self.dtype,
+            params_dtype=self.params_dtype,
+        )
 
     def __call__(
         self,
@@ -1002,12 +1088,21 @@ class FlaxWhisperPreTrainedModel(FlaxPreTrainedModel):
         dtype: jnp.dtype = jnp.float32,
         params_dtype: jnp.dtype = jnp.float32,
         _do_init: bool = True,
+        attention_backend: str = "default",
         **kwargs,
     ):
+        _validate_attention_backend(attention_backend, dtype)
+
         if input_shape is None:
             input_shape = (1, config.num_mel_bins, 2 * config.max_source_positions)
 
-        module = self.module_class(config=config, dtype=dtype, params_dtype=params_dtype, **kwargs)
+        module = self.module_class(
+            config=config,
+            dtype=dtype,
+            params_dtype=params_dtype,
+            attention_backend=attention_backend,
+            **kwargs,
+        )
         super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
 
     def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
@@ -1323,9 +1418,15 @@ class FlaxWhisperForConditionalGenerationModule(nn.Module):
     config: WhisperConfig
     dtype: jnp.dtype = jnp.float32
     params_dtype: jnp.dtype = jnp.float32
+    attention_backend: str = "default"
 
     def setup(self) -> None:
-        self.model = FlaxWhisperModule(config=self.config, dtype=self.dtype, params_dtype=self.params_dtype)
+        self.model = FlaxWhisperModule(
+            config=self.config,
+            attention_backend=self.attention_backend,
+            dtype=self.dtype,
+            params_dtype=self.params_dtype,
+        )
         self.lm_head = layers.DenseGeneral(
             self.config.vocab_size,
             use_bias=False,

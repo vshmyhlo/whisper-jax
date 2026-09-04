@@ -24,12 +24,12 @@ from flax import jax_utils
 from flax.core.frozen_dict import freeze
 from flax.training.common_utils import shard
 from jax.sharding import PartitionSpec as P
-from transformers import WhisperProcessor, is_tokenizers_available, WhisperFeatureExtractor, WhisperTokenizerFast
+from transformers import WhisperProcessor, WhisperTokenizerFast, is_tokenizers_available
 from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE, WhisperTokenizer
 from transformers.pipelines.audio_utils import ffmpeg_read
 from transformers.utils import logging
 
-from .modeling_flax_whisper import FlaxWhisperForConditionalGeneration
+from .modeling_flax_whisper import FlaxWhisperForConditionalGeneration, _validate_attention_backend
 from .partitioner import PjitPartitioner
 from .train_state import InferenceState
 
@@ -59,6 +59,7 @@ class FlaxWhisperPipline:
         dtype=jnp.float32,
         batch_size=None,
         max_length=None,
+        attention_backend="default",
     ):
         """
         Args
@@ -75,9 +76,16 @@ class FlaxWhisperPipline:
                 a batch size in the `__init__` method will be superseded by any batch size passed to the `__call__` method.
             max_length (`int`, *optional*):
                 The maximum numbers of tokens to generate. Defaults to `model.config.max_length`.
+            attention_backend (`str`, *optional*, defaults to `"default"`):
+                Attention implementation to use. Set to `"cudnn"` to opt into JAX's cuDNN Flash Attention backend on
+                supported NVIDIA GPUs using `jax.numpy.float16` or `jax.numpy.bfloat16` computation. Requests for
+                attention weights and training with attention dropout use the default implementation.
         """
+        _validate_attention_backend(attention_backend, dtype)
+
         self.checkpoint = checkpoint
         self.dtype = dtype
+        self.attention_backend = attention_backend
 
         self.processor = WhisperProcessor.from_pretrained(self.checkpoint)
         self.feature_extractor = self.processor.feature_extractor
@@ -89,6 +97,7 @@ class FlaxWhisperPipline:
             self.checkpoint,
             _do_init=False,
             dtype=self.dtype,
+            attention_backend=self.attention_backend,
         )
 
         self.max_length = max_length if max_length is not None else self.model.generation_config.max_length
