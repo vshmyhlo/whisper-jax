@@ -1,0 +1,137 @@
+{
+  "description": "Isolated embedding lookup replacement: one-hot matmuls versus gathers, with identical precision settings and inputs.",
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "jax_version": "0.8.2",
+  "jax_activation_dtype": "bfloat16",
+  "jax_params_dtype": "float32",
+  "max_length": 96,
+  "all_12_bfloat16_generated_token_sequences_unchanged": true,
+  "executables": {
+    "tiny.en_generate_False": {
+      "one_hot": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152001024,
+          "output_size_in_bytes": 384,
+          "temp_size_in_bytes": 339458776,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 92
+      },
+      "gather": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152001024,
+          "output_size_in_bytes": 384,
+          "temp_size_in_bytes": 259107544,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 89,
+        "embedding_lookup_dots": 0
+      }
+    },
+    "tiny.en_generate_True": {
+      "one_hot": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152001024,
+          "output_size_in_bytes": 384,
+          "temp_size_in_bytes": 339458648,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 92
+      },
+      "gather": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152001024,
+          "output_size_in_bytes": 384,
+          "temp_size_in_bytes": 259107416,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 89,
+        "embedding_lookup_dots": 0
+      }
+    },
+    "tiny.en_forward_dp": {
+      "one_hot": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152001028,
+          "output_size_in_bytes": 103728,
+          "temp_size_in_bytes": 145562288,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 88
+      },
+      "gather": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152001028,
+          "output_size_in_bytes": 103728,
+          "temp_size_in_bytes": 145562244,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 85,
+        "embedding_lookup_dots": 0
+      }
+    },
+    "tiny_generate_False": {
+      "one_hot": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152002560,
+          "output_size_in_bytes": 384,
+          "temp_size_in_bytes": 339461848,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 92
+      },
+      "gather": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152002560,
+          "output_size_in_bytes": 384,
+          "temp_size_in_bytes": 259109080,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 89,
+        "embedding_lookup_dots": 0
+      }
+    },
+    "tiny_generate_True": {
+      "one_hot": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152002560,
+          "output_size_in_bytes": 384,
+          "temp_size_in_bytes": 339461976,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 92
+      },
+      "gather": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152002560,
+          "output_size_in_bytes": 384,
+          "temp_size_in_bytes": 259109208,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 89,
+        "embedding_lookup_dots": 0
+      }
+    },
+    "tiny_forward_dp": {
+      "one_hot": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152002572,
+          "output_size_in_bytes": 311190,
+          "temp_size_in_bytes": 256499912,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 92
+      },
+      "gather": {
+        "memory_bytes": {
+          "argument_size_in_bytes": 152002572,
+          "output_size_in_bytes": 311190,
+          "temp_size_in_bytes": 256490624,
+          "alias_size_in_bytes": 0
+        },
+        "dot_operations": 89,
+        "embedding_lookup_dots": 0
+      }
+    }
+  }
+}

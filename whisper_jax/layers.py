@@ -585,8 +585,13 @@ class Embed(nn.Module):
             one_hot = jnp.array(inputs[..., jnp.newaxis] == iota, dtype=self.dtype)
             output = jnp.dot(one_hot, jnp.asarray(self.embedding, self.dtype))
         else:
-            output = jnp.asarray(self.embedding, self.dtype)[inputs]
-            output = with_sharding_constraint(output, ("batch", "length", "embed"))
+            # Gather before casting: a token lookup must not convert or multiply
+            # the entire vocabulary table on every autoregressive step. Preserve
+            # one-hot semantics for padding positions and out-of-range IDs.
+            output = self.embedding[jnp.clip(inputs, 0, self.num_embeddings - 1)].astype(self.dtype)
+            output = jnp.where(((inputs >= 0) & (inputs < self.num_embeddings))[..., None], output, 0)
+            if output.ndim == 3:
+                output = with_sharding_constraint(output, ("batch", "length", "embed"))
         return output
 
     def attend(self, query: Array) -> Array:
@@ -785,11 +790,13 @@ class LayerNorm(nn.Module):
         mul = lax.rsqrt(var + self.epsilon)
         if self.use_scale:
             scale = param_with_axes("scale", self.scale_init, (features,), self.params_dtype, axes=("embed",))
-            mul = mul * jnp.asarray(scale, self.dtype)
+            # Match Whisper's FP32 LayerNorm computation without rounding FP32
+            # parameters to the activation dtype before applying the affine transform.
+            mul = mul * jnp.asarray(scale, jnp.float32)
         y = (x - mean) * mul
         if self.use_bias:
             bias = param_with_axes("bias", self.bias_init, (features,), self.params_dtype, axes=("embed",))
-            y = y + jnp.asarray(bias, self.dtype)
+            y = y + jnp.asarray(bias, jnp.float32)
         return jnp.asarray(y, self.dtype)
 
 

@@ -242,13 +242,15 @@ class FlaxWhisperPipline:
                     )
                 forced_decoder_ids.append((1, generation_config.lang_to_id[language_token]))
 
-            if task is not None:
-                forced_decoder_ids.append((2, generation_config.task_to_id[task]))
-            else:
-                forced_decoder_ids.append((2, generation_config.task_to_id["transcribe"]))
+            task = task or "transcribe"
+            if task not in generation_config.task_to_id:
+                raise ValueError(
+                    f"Unsupported task: {task!r}. Task should be one of: {list(generation_config.task_to_id)}."
+                )
+            forced_decoder_ids.append((2, generation_config.task_to_id[task]))
 
         if not return_timestamps:
-            if forced_decoder_ids and forced_decoder_ids[-1][0] != generation_config.no_timestamps_token_id:
+            if not forced_decoder_ids or forced_decoder_ids[-1][1] != generation_config.no_timestamps_token_id:
                 idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
                 forced_decoder_ids.append((idx, generation_config.no_timestamps_token_id))
 

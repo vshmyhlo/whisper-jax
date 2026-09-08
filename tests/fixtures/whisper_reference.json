@@ -1,0 +1,27 @@
+{
+  "config": {
+    "vocab_size": 32,
+    "num_mel_bins": 4,
+    "d_model": 8,
+    "encoder_layers": 2,
+    "decoder_layers": 2,
+    "encoder_attention_heads": 2,
+    "decoder_attention_heads": 2,
+    "encoder_ffn_dim": 32,
+    "decoder_ffn_dim": 32,
+    "max_source_positions": 4,
+    "max_target_positions": 8,
+    "pad_token_id": 0,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "decoder_start_token_id": 1
+  },
+  "openai_root": "https://raw.githubusercontent.com/openai/whisper/v20250625/whisper/",
+  "source_hashes": {
+    "model.py": "473491a97554ad1d0beaaef6fe91d965f12785b466b93ebb61024307b50ad683",
+    "decoding.py": "94084fedc5af74cabf8e1883a85552700057081f00ea669ad49435ecb29039db"
+  },
+  "legacy_commit": "f983178a80ad37cf2f655777c26a74438b5d8690",
+  "legacy_hash": "b6cd88a89ea78f4c6f63e30ac0fac8dbfadffc93a8087110a9c965979f6301a1",
+  "torch_version": "2.14.0"
+}

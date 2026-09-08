@@ -14,6 +14,7 @@
 # limitations under the License.
 """ Flax whisper model."""
 
+import copy
 import random
 from functools import partial
 from typing import Optional, Tuple
@@ -31,7 +32,10 @@ from transformers import WhisperConfig
 from transformers.generation.flax_logits_process import (
     FlaxLogitsProcessor,
     FlaxLogitsProcessorList,
-    FlaxWhisperTimeStampLogitsProcessor,
+    FlaxSuppressTokensAtBeginLogitsProcessor,
+)
+from transformers.generation.flax_logits_process import (
+    FlaxWhisperTimeStampLogitsProcessor as TransformersFlaxWhisperTimeStampLogitsProcessor,
 )
 from transformers.modeling_flax_outputs import (
     FlaxBaseModelOutput,
@@ -47,6 +51,7 @@ from transformers.modeling_flax_utils import (
     append_replace_return_docstrings,
     overwrite_call_docstring,
 )
+from transformers.models.whisper.tokenization_whisper import TO_LANGUAGE_CODE
 from transformers.utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -207,24 +212,32 @@ class FlaxStaticForceTokensLogitsProcessor(FlaxLogitsProcessor):
     Args:
         force_token_map (`list`):
             Map giving token ids and indices where they will be forced to be sampled.
+        decoder_input_length (`int`, *optional*, defaults to 1):
+            Prompt length. Forced positions are relative to its final token, as in Transformers generation.
     """
 
-    def __init__(self, force_token_map):
+    def __init__(self, force_token_map, decoder_input_length=1):
+        self.prompt_offset = decoder_input_length - 1
         # The generic `transformers` logit processor builds `force_token_array` as a dictionary - this is not a valid
         # JAX type, and so we switch to using a JAX array instead
         force_token_map = jnp.array(force_token_map)
         # Converts the array of format [[index, token]] containing the tokens to be forced to an array, where the
         # index of the array corresponds to the index of the token to be forced. For XLA compatibility,
         # indexes without forced tokens will have a negative value. Note that the last token we ever need to force in
-        # Whisper is at position 3, so we only construct an array up to this index. The native version constructs a tensor
+        # Whisper is at position 3, so we construct an array that includes this index. The native version constructs a tensor
         # dynamically according to the length of the `force_token_map`. Array shapes need to be concrete for XLA compatibility,
         # so this is not permitted here.
-        force_token_array = jnp.ones(3, dtype=jnp.int32) * -1
+        force_token_array = jnp.full(4, -1, dtype=jnp.int32)
         for index, token in force_token_map:
             force_token_array = force_token_array.at[index].set(token)
         self.force_token_array = jnp.int32(force_token_array)
+        self.begin_index = decoder_input_length + jnp.max(
+            jnp.where(self.force_token_array >= 0, jnp.arange(self.force_token_array.shape[0]), 0)
+        )
 
     def __call__(self, input_ids: jnp.ndarray, scores: jnp.ndarray, cur_len: int) -> jnp.ndarray:
+        cur_len = cur_len - self.prompt_offset
+
         def _force_token(generation_idx):
             batch_size = scores.shape[0]
             current_token = self.force_token_array[generation_idx]
@@ -248,6 +261,53 @@ class FlaxStaticForceTokensLogitsProcessor(FlaxLogitsProcessor):
             ),
         )
         return scores
+
+
+class FlaxWhisperTimeStampLogitsProcessor(TransformersFlaxWhisperTimeStampLogitsProcessor):
+    """Whisper timestamp constraints with correct prompt gating and monotonic timestamps."""
+
+    def __call__(self, input_ids, scores, cur_len):
+        def apply_timestamp_rules(scores):
+            positions = jnp.arange(input_ids.shape[-1])[None, :]
+            generated_timestamp = (
+                (positions >= self.begin_index) & (positions < cur_len) & (input_ids >= self.timestamp_begin)
+            )
+            last_timestamp_position = jnp.max(jnp.where(generated_timestamp, positions, -1), axis=-1)
+            has_timestamp = last_timestamp_position >= 0
+            gather_position = jnp.maximum(last_timestamp_position, 0)[:, None]
+            last_timestamp = jnp.take_along_axis(input_ids, gather_position, axis=-1)[:, 0]
+
+            last_was_timestamp = (cur_len > self.begin_index) & (
+                input_ids[:, jnp.maximum(cur_len - 1, 0)] >= self.timestamp_begin
+            )
+            penultimate_was_timestamp = (cur_len <= self.begin_index + 1) | (
+                input_ids[:, jnp.maximum(cur_len - 2, 0)] >= self.timestamp_begin
+            )
+            # After a segment's closing timestamp, the next opening timestamp may equal it.
+            # Otherwise require a later timestamp so each segment has nonzero duration.
+            closes_timestamp_pair = last_was_timestamp & ~penultimate_was_timestamp
+            minimum_timestamp = last_timestamp + (~closes_timestamp_pair).astype(last_timestamp.dtype)
+
+            token_ids = jnp.arange(scores.shape[-1])[None, :]
+            decreasing_timestamp = (
+                has_timestamp[:, None] & (token_ids >= self.timestamp_begin) & (token_ids < minimum_timestamp[:, None])
+            )
+            scores = jnp.where(decreasing_timestamp, -float("inf"), scores)
+
+            # Whisper decoding always begins a timestamped segment with a timestamp token.
+            initial_text_token = (cur_len == self.begin_index) & (token_ids < self.timestamp_begin)
+            scores = jnp.where(initial_text_token, -float("inf"), scores)
+            # Apply these masks before the parent's timestamp probability comparison: forbidden
+            # timestamps must not cause valid text (or EOS) to be suppressed.
+            # OpenAI Whisper compares cumulative probabilities in float32, including for
+            # reduced-precision logits. Rounding this comparison can select the wrong token type.
+            return (
+                super(FlaxWhisperTimeStampLogitsProcessor, self)
+                .__call__(input_ids, scores.astype(jnp.float32), cur_len)
+                .astype(scores.dtype)
+            )
+
+        return lax.cond(cur_len < self.begin_index, lambda scores: scores, apply_timestamp_rules, scores)
 
 
 class FlaxWhisperAttention(nn.Module):
@@ -351,8 +411,7 @@ class FlaxWhisperAttention(nn.Module):
         elif attention_mask is not None:
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
 
-        # During fast autoregressive decoding, we feed one position at a time,
-        # and cache the keys and values step by step.
+        # During fast autoregressive decoding, cache the initial prompt as one chunk and then append generated tokens.
 
         if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
             key_states, value_states, attention_mask = self._concatenate_to_cache(
@@ -402,7 +461,8 @@ class FlaxWhisperAttention(nn.Module):
                 deterministic=deterministic,
                 dtype=self.dtype,
                 precision=None,
-            )
+                force_fp32_for_softmax=True,
+            ).astype(self.dtype)
 
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
         attn_output = self._merge_heads(attn_output)
@@ -435,38 +495,36 @@ class FlaxWhisperAttention(nn.Module):
 
         if is_initialized:
             batch_size, num_heads, head_dim, seq_length = cached_key.value.shape
-            # During fast autoregressive decoding, we feed one position at a time,
-            # and cache the keys and values step by step.
+            # During fast autoregressive decoding, append this prompt chunk or generated token to the cache.
             # Sanity shape check of cached key against input query.
             num_updated_cache_vectors = query.shape[1]
-            expected_shape = (batch_size, 1, num_heads, head_dim)
-            if num_updated_cache_vectors == 1 and expected_shape != query.shape:
+            expected_shape = (batch_size, num_updated_cache_vectors, num_heads, head_dim)
+            if expected_shape != query.shape:
                 raise ValueError(
                     f"Autoregressive cache shape error, expected query shape {expected_shape} instead got {query.shape}"
                 )
 
-            # Create a OHE of the current index. NOTE: the index is increased below.
+            # Read the first insertion position. NOTE: the index is increased below.
             cur_index = cache_index.value
 
             # In order to update the key, value caches with the current key and
             # value, we move the seq_length axis to the back, similar to what we did for
             # the cached ones above.
-            # Note these are currently the key and value of a single position, since
-            # we feed one position at a time.
-            one_token_key = jnp.moveaxis(key, -3, -1)
-            one_token_value = jnp.moveaxis(value, -3, -1)
+            new_key_vectors = jnp.moveaxis(key, -3, -1)
+            new_value_vectors = jnp.moveaxis(value, -3, -1)
 
             # Update key, value caches with our new 1d spatial slices.
             # We implement an efficient scatter into the cache via one-hot
             # broadcast and addition.
             if num_updated_cache_vectors > 1:
-                indices = jnp.eye(num_updated_cache_vectors, seq_length)[None, None]
-                key = cached_key.value + jnp.matmul(one_token_key, indices)
-                value = cached_value.value + jnp.matmul(one_token_value, indices)
+                cache_positions = cur_index + jnp.arange(num_updated_cache_vectors)
+                indices = jax.nn.one_hot(cache_positions, seq_length, dtype=key.dtype)[None, None]
+                key = cached_key.value + jnp.matmul(new_key_vectors, indices)
+                value = cached_value.value + jnp.matmul(new_value_vectors, indices)
             else:
                 one_hot_indices = jax.nn.one_hot(cur_index, seq_length, dtype=key.dtype)
-                key = cached_key.value + one_token_key * one_hot_indices
-                value = cached_value.value + one_token_value * one_hot_indices
+                key = cached_key.value + new_key_vectors * one_hot_indices
+                value = cached_value.value + new_value_vectors * one_hot_indices
 
             cached_key.value = key
             cached_value.value = value
@@ -476,9 +534,7 @@ class FlaxWhisperAttention(nn.Module):
             key = jnp.moveaxis(key, -1, -3)
             value = jnp.moveaxis(value, -1, -3)
 
-            # causal mask for cached decoder self-attention: our single query position should only
-            # attend to those key positions that have already been generated and cached, not the
-            # remaining zero elements.
+            # Cached decoder self-attention may only attend to populated cache positions, not the remaining zeros.
             pad_mask = jnp.broadcast_to(
                 jnp.arange(seq_length) < cur_index + num_updated_cache_vectors,
                 (batch_size,) + (1, num_updated_cache_vectors, seq_length),
@@ -869,7 +925,11 @@ class FlaxWhisperEncoder(nn.Module):
             params_dtype=self.params_dtype,
         )
         self.embed_positions = layers.Embed(
-            self.config.max_source_positions, self.config.d_model, dtype=self.dtype, params_dtype=self.params_dtype
+            self.config.max_source_positions,
+            self.config.d_model,
+            dtype=self.dtype,
+            params_dtype=self.params_dtype,
+            one_hot=False,
         )
 
         self.layer_norm = layers.LayerNorm(dtype=self.dtype, epsilon=1e-05, params_dtype=self.params_dtype)
@@ -937,10 +997,18 @@ class FlaxWhisperDecoder(nn.Module):
 
     def setup(self) -> None:
         self.embed_tokens = layers.Embed(
-            self.config.vocab_size, self.config.d_model, dtype=self.dtype, params_dtype=self.params_dtype
+            self.config.vocab_size,
+            self.config.d_model,
+            dtype=self.dtype,
+            params_dtype=self.params_dtype,
+            one_hot=False,
         )
         self.embed_positions = layers.Embed(
-            self.config.max_target_positions, self.config.d_model, dtype=self.dtype, params_dtype=self.params_dtype
+            self.config.max_target_positions,
+            self.config.d_model,
+            dtype=self.dtype,
+            params_dtype=self.params_dtype,
+            one_hot=False,
         )
 
         self.layers = FlaxWhisperDecoderLayerCollection(
@@ -1152,6 +1220,11 @@ class FlaxWhisperPreTrainedModel(FlaxPreTrainedModel):
                 is a sequence of hidden-states at the output of the last layer of the encoder. Used in the
                 cross-attention of the decoder.
         """
+        if max_length <= 0 or max_length > self.config.max_target_positions:
+            raise ValueError(
+                f"`max_length` must be between 1 and {self.config.max_target_positions}, got {max_length}."
+            )
+
         # init input variables to retrieve cache
         decoder_input_ids = jnp.ones((batch_size, max_length), dtype="i4")
         decoder_attention_mask = jnp.ones_like(decoder_input_ids)
@@ -1294,6 +1367,12 @@ class FlaxWhisperPreTrainedModel(FlaxPreTrainedModel):
                 decoder_position_ids = jnp.broadcast_to(
                     jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
                 )
+        elif decoder_position_ids.shape not in ((sequence_length,), (1, sequence_length), decoder_input_ids.shape):
+            raise ValueError(
+                "`decoder_position_ids` must have the same shape as `decoder_input_ids` or share one position "
+                "sequence across the batch, got "
+                f"{decoder_position_ids.shape} and {decoder_input_ids.shape}."
+            )
 
         if decoder_attention_mask is None:
             decoder_attention_mask = jnp.ones((batch_size, sequence_length))
@@ -1308,7 +1387,9 @@ class FlaxWhisperPreTrainedModel(FlaxPreTrainedModel):
         # if past_key_values are passed then cache is already initialized a private flag init_cache has to be
         # passed down to ensure cache is used. It has to be made sure that cache is marked as mutable so that
         # it can be changed by FlaxWhisperAttention module
-        if past_key_values:
+        if past_key_values is not None:
+            if not past_key_values:
+                raise ValueError("`past_key_values` must be a non-empty cache returned by `init_cache` or `decode`.")
             inputs["cache"] = past_key_values
             mutable = ["cache"]
         else:
@@ -1552,6 +1633,12 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
                 decoder_position_ids = jnp.broadcast_to(
                     jnp.arange(sequence_length)[None, :], (batch_size, sequence_length)
                 )
+        elif decoder_position_ids.shape not in ((sequence_length,), (1, sequence_length), decoder_input_ids.shape):
+            raise ValueError(
+                "`decoder_position_ids` must have the same shape as `decoder_input_ids` or share one position "
+                "sequence across the batch, got "
+                f"{decoder_position_ids.shape} and {decoder_input_ids.shape}."
+            )
         if decoder_attention_mask is None:
             decoder_attention_mask = jnp.ones((batch_size, sequence_length), dtype="i4")
 
@@ -1565,7 +1652,9 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         # if past_key_values are passed then cache is already initialized a private flag init_cache has to be
         # passed down to ensure cache is used. It has to be made sure that cache is marked as mutable so that
         # it can be changed by FlaxWhisperAttention module
-        if past_key_values:
+        if past_key_values is not None:
+            if not past_key_values:
+                raise ValueError("`past_key_values` must be a non-empty cache returned by `init_cache` or `decode`.")
             inputs["cache"] = past_key_values
             mutable = ["cache"]
         else:
@@ -1639,8 +1728,12 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         is_multilingual=None,
         **kwargs,
     ):
-        if generation_config is None:
-            generation_config = self.generation_config
+        generation_config = copy.deepcopy(self.generation_config if generation_config is None else generation_config)
+        # Whisper processors must see the same overrides as the generation loop.
+        generation_config.update(**kwargs)
+        # The prompt below normalizes this option; do not let the parent restore its raw value.
+        if "forced_decoder_ids" in kwargs:
+            generation_config.forced_decoder_ids = kwargs.pop("forced_decoder_ids")
 
         if return_timestamps is not None:
             generation_config.return_timestamps = return_timestamps
@@ -1654,37 +1747,71 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         if language is not None:
             generation_config.language = language
 
-        if kwargs is not None and "decoder_input_ids" in kwargs:
-            decoder_input_length = len(kwargs["decoder_input_ids"])
+        if kwargs.get("decoder_input_ids") is not None:
+            decoder_input_length = kwargs["decoder_input_ids"].shape[-1]
         else:
             decoder_input_length = 1
 
-        forced_decoder_ids = []
+        is_multilingual = getattr(generation_config, "is_multilingual", False)
+        # The transformers Flax timestamp processor expects this attribute even for English-only checkpoints.
+        generation_config.is_multilingual = is_multilingual
 
-        if hasattr(generation_config, "is_multilingual") and generation_config.is_multilingual:
-            if hasattr(generation_config, "language"):
-                forced_decoder_ids.append((1, generation_config.lang_to_id[generation_config.language]))
+        configured_forced_decoder_ids = copy.deepcopy(getattr(generation_config, "forced_decoder_ids", None) or [])
+        language = getattr(generation_config, "language", None)
+        task = getattr(generation_config, "task", None)
+        use_configured_forced_decoder_ids = bool(configured_forced_decoder_ids) and language is None and task is None
+        forced_decoder_ids = configured_forced_decoder_ids if use_configured_forced_decoder_ids else []
+
+        if is_multilingual and not use_configured_forced_decoder_ids:
+            if language is not None:
+                if not isinstance(language, str):
+                    raise TypeError(f"`language` must be a string, got {type(language).__name__}.")
+                language = language.lower()
+                if language in generation_config.lang_to_id:
+                    language_token = language
+                elif language in TO_LANGUAGE_CODE.values():
+                    language_token = f"<|{language}|>"
+                elif language in TO_LANGUAGE_CODE:
+                    language_token = f"<|{TO_LANGUAGE_CODE[language]}|>"
+                else:
+                    raise ValueError(f"Unsupported language: {language!r}.")
+                if language_token not in generation_config.lang_to_id:
+                    raise ValueError(f"Language {language!r} is not supported by this checkpoint.")
+                forced_decoder_ids.append((1, generation_config.lang_to_id[language_token]))
             else:
                 forced_decoder_ids.append((1, None))
 
-            if hasattr(generation_config, "task"):
-                forced_decoder_ids.append((2, generation_config.task_to_id[generation_config.task]))
-            else:
-                forced_decoder_ids.append((2, generation_config.task_to_id["transcribe"]))
+            task = task or "transcribe"
+            if task not in generation_config.task_to_id:
+                raise ValueError(f"Unsupported task: {task!r}.")
+            forced_decoder_ids.append((2, generation_config.task_to_id[task]))
 
-        if (
-            hasattr(generation_config, "return_timestamps") and generation_config.return_timestamps
-        ) or return_timestamps:
-            logits_processor = [
-                FlaxWhisperTimeStampLogitsProcessor(generation_config, self.config, decoder_input_length)
+        return_timestamps = bool(getattr(generation_config, "return_timestamps", False))
+        no_timestamps_token_id = getattr(generation_config, "no_timestamps_token_id", None)
+        if return_timestamps:
+            if no_timestamps_token_id is None:
+                raise ValueError("Timestamp generation requires `generation_config.no_timestamps_token_id`.")
+            forced_decoder_ids = [
+                (index, token_id) for index, token_id in forced_decoder_ids if token_id != no_timestamps_token_id
             ]
+            timestamp_processor = FlaxWhisperTimeStampLogitsProcessor(
+                generation_config, self.config, decoder_input_length
+            )
+            # This is the first freely generated position. The transformers processor adds an extra position to
+            # its constructor argument, so set the intended value explicitly.
+            timestamp_processor.begin_index = decoder_input_length + (
+                forced_decoder_ids[-1][0] if forced_decoder_ids else 0
+            )
+            logits_processor = FlaxLogitsProcessorList(logits_processor or [])
+            logits_processor.append(timestamp_processor)
         else:
-            if forced_decoder_ids and forced_decoder_ids[-1][0] != generation_config.no_timestamps_token_id:
+            if no_timestamps_token_id is not None and (
+                not forced_decoder_ids or forced_decoder_ids[-1][1] != no_timestamps_token_id
+            ):
                 idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
-                forced_decoder_ids.append((idx, generation_config.no_timestamps_token_id))
+                forced_decoder_ids.append((idx, no_timestamps_token_id))
 
-        if len(forced_decoder_ids) > 0:
-            generation_config.forced_decoder_ids = forced_decoder_ids
+        generation_config.forced_decoder_ids = forced_decoder_ids or None
 
         return super().generate(
             input_features,
@@ -1701,18 +1828,37 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         generation_config=None,
         **kwargs,
     ):
-        if generation_config is None:
-            generation_config = self.generation_config
+        generation_config = copy.deepcopy(self.generation_config if generation_config is None else generation_config)
+        generation_config.update(**kwargs)
 
         # override the generation config forced decoder ids in preference of the ones we have set
         generation_config.forced_decoder_ids = None
+        generation_config.is_multilingual = getattr(generation_config, "is_multilingual", False)
 
+        decoder_input_ids = kwargs.get("decoder_input_ids")
+        decoder_input_length = decoder_input_ids.shape[-1] if decoder_input_ids is not None else 1
+        force_processor = FlaxStaticForceTokensLogitsProcessor(forced_decoder_ids, decoder_input_length)
         logits_processor = FlaxLogitsProcessorList()
+        if generation_config.begin_suppress_tokens is not None:
+            logits_processor.append(
+                FlaxSuppressTokensAtBeginLogitsProcessor(
+                    generation_config.begin_suppress_tokens, force_processor.begin_index
+                )
+            )
+        # The parent's processor cannot account for the dynamic forced-token map.
+        generation_config.begin_suppress_tokens = None
+        kwargs.pop("begin_suppress_tokens", None)
+        logits_processor.append(force_processor)
+        logits_processor.extend(kwargs.pop("logits_processor", None) or [])
 
-        logits_processor.append(FlaxStaticForceTokensLogitsProcessor(forced_decoder_ids))
-
-        if hasattr(generation_config, "return_timestamps") and return_timestamps:
-            logits_processor.append(FlaxWhisperTimeStampLogitsProcessor(generation_config, self.config, 1))
+        if return_timestamps:
+            if getattr(generation_config, "no_timestamps_token_id", None) is None:
+                raise ValueError("Timestamp generation requires `generation_config.no_timestamps_token_id`.")
+            timestamp_processor = FlaxWhisperTimeStampLogitsProcessor(
+                generation_config, self.config, decoder_input_length
+            )
+            timestamp_processor.begin_index = force_processor.begin_index
+            logits_processor.append(timestamp_processor)
 
         return super().generate(
             input_features,
@@ -1732,6 +1878,21 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
     ):
         # initializing the cache
         batch_size, seq_length = decoder_input_ids.shape
+
+        if max_length <= seq_length:
+            raise ValueError(
+                f"`max_length` ({max_length}) must be greater than the decoder prompt length ({seq_length})."
+            )
+        if max_length > self.config.max_target_positions:
+            raise ValueError(
+                f"`max_length` ({max_length}) cannot exceed `config.max_target_positions` "
+                f"({self.config.max_target_positions})."
+            )
+        if decoder_attention_mask is not None and decoder_attention_mask.shape != decoder_input_ids.shape:
+            raise ValueError(
+                "`decoder_attention_mask` must have the same shape as `decoder_input_ids`, got "
+                f"{decoder_attention_mask.shape} and {decoder_input_ids.shape}."
+            )
 
         past_key_values = self.init_cache(batch_size, max_length, encoder_outputs)
         # Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
