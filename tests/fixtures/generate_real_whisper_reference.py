@@ -45,8 +45,14 @@ def download(url, target, checksum):
         raise ValueError(f"Checksum mismatch: {target}")
 
 
+def checkpoint_sha256(path):
+    # Stream large checkpoints rather than allocating another multi-GB copy.
+    with path.open("rb") as checkpoint:
+        return hashlib.file_digest(checkpoint, "sha256").hexdigest()
+
+
 @torch.no_grad()
-def prepare(output, checkpoints, device):
+def prepare(output, checkpoints, device, compress_params=True):
     if whisper.__version__ != "20250625":
         raise ValueError("Use openai-whisper==20250625 to keep the reference implementation fixed")
     output.mkdir(parents=True, exist_ok=True)
@@ -67,9 +73,12 @@ def prepare(output, checkpoints, device):
         waves[name] = whisper.load_audio(str(path))
 
     for checkpoint in checkpoints:
+        print(f"Loading original {checkpoint} checkpoint on {device}", flush=True)
         model = whisper.load_model(checkpoint, device=device, download_root=str(output)).eval()
         assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
-        tokenizer = whisper.tokenizer.get_tokenizer(model.is_multilingual, language="en", task="transcribe")
+        tokenizer = whisper.tokenizer.get_tokenizer(
+            model.is_multilingual, num_languages=model.num_languages, language="en", task="transcribe"
+        )
         dims = model.dims
         config = WhisperConfig(
             vocab_size=dims.n_vocab,
@@ -97,11 +106,13 @@ def prepare(output, checkpoints, device):
                 value = value.T if value.ndim == 2 else value.transpose(2, 1, 0)
             assert value.shape == shape.shape, (key, value.shape, shape.shape)
             params["/".join(key)] = value
-        np.savez_compressed(output / f"{checkpoint}_params.npz", **params)
+        print(f"Exporting {checkpoint} FP32 parameters", flush=True)
+        save_params = np.savez_compressed if compress_params else np.savez
+        save_params(output / f"{checkpoint}_params.npz", **params)
         model_info = {
             "config": config.to_dict(),
             "checkpoint_url": whisper._MODELS[checkpoint],
-            "checkpoint_sha256": hashlib.sha256((output / f"{checkpoint}.pt").read_bytes()).hexdigest(),
+            "checkpoint_sha256": checkpoint_sha256(output / f"{checkpoint}.pt"),
             "is_multilingual": model.is_multilingual,
             "no_timestamps_token_id": tokenizer.no_timestamps,
             "timestamp_begin": tokenizer.timestamp_begin,
@@ -115,7 +126,7 @@ def prepare(output, checkpoints, device):
         pieces = [tokenizer.encoding.decode_single_token_bytes(i).hex() for i in range(dims.n_vocab)]
         (output / f"{checkpoint}_token_bytes.json").write_text(json.dumps(pieces))
         for audio_name, waveform in waves.items():
-            mel = whisper.log_mel_spectrogram(whisper.pad_or_trim(waveform)).to(device)
+            mel = whisper.log_mel_spectrogram(whisper.pad_or_trim(waveform), n_mels=dims.n_mels).to(device)
             for timestamps in (False, True):
                 options = whisper.DecodingOptions(language="en", without_timestamps=not timestamps, sample_len=92)
                 assert options.fp16  # Keep the reference's original precision in every comparison.
@@ -169,6 +180,11 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoints", nargs="+", default=["tiny.en", "tiny"])
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--uncompressed-params", action="store_true", help="Trade disk space for faster large-model I/O"
+    )
     arguments = parser.parse_args()
     torch.set_num_threads(4)
-    prepare(arguments.output, arguments.checkpoints, arguments.device)
+    prepare(
+        arguments.output, arguments.checkpoints, arguments.device, compress_params=not arguments.uncompressed_params
+    )

@@ -49,8 +49,11 @@ def load_model(directory, name, info, dtype):
     config = WhisperConfig(**info["config"])
     model = FlaxWhisperForConditionalGeneration(config, dtype=dtype, _do_init=False)
     with np.load(directory / f"{name}_params.npz", allow_pickle=False) as data:
-        assert all(value.dtype == np.float32 for value in data.values()), "Parameters must remain FP32"
-        params = unflatten_dict({tuple(key.split("/")): jnp.array(value) for key, value in data.items()})
+        params = {}
+        for key, value in data.items():
+            assert value.dtype == np.float32, "Parameters must remain FP32"
+            params[tuple(key.split("/"))] = jnp.array(value)
+        params = unflatten_dict(params)
     generation = model.generation_config
     generation.is_multilingual = info["is_multilingual"]
     generation.no_timestamps_token_id = info["no_timestamps_token_id"]
@@ -220,6 +223,7 @@ def evaluate(directory, dtypes=("float32", "float16", "bfloat16"), hlo_directory
         extractor = WhisperFeatureExtractor(feature_size=info["config"]["num_mel_bins"])
         for dtype_name in dtypes:
             dtype = getattr(jnp, dtype_name)
+            print(f"Loading {name}: {dtype_name} computation / float32 parameters", flush=True)
             model, params = load_model(directory, name, info, dtype)
             encode = jax.jit(lambda p, x: model.encode(x, params=p).last_hidden_state)
             teacher_force = jax.jit(lambda p, enc, ids, tokens: cached_reference_logits(model, p, enc, ids, tokens))

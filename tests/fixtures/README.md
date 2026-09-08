@@ -62,3 +62,16 @@ BF16 currently matches 9/12 sequences exactly, so its bounded-error test must no
 be interpreted as exact parity. Two-device runs additionally inspect data-parallel
 forward HLO, check separate replica results, and reject unexpected collectives,
 host callbacks, or dense embedding lookups.
+
+`large-v3` uses the same three recordings and two timestamp modes, prepared in a
+separate directory with `--checkpoints large-v3`. Its feature count and tokenizer
+language count come from the original checkpoint (128 Mel bins and 100 languages).
+Set `WHISPER_LARGE_V3_PARITY_DIR` to enable `tests/test_large_v3_parity.py`; this suite
+is independent of the smaller default integration matrix. The reference keeps
+native FP16 computation and FP32 parameters for every JAX dtype comparison.
+The [large-v3 report](../../benchmarks/reports/large_v3_audio_parity.json) records
+6/6 exact sequences for FP32 and FP16, and 5/6 for BF16. The BF16 difference is
+“counseled” versus native “counselled” on clip 2 without timestamps. Numerical error
+and token drift are bounded per case by the separate large-model regression suite.
+Use `--uncompressed-params` to export the large FP32 parameter archive faster at
+the cost of additional disk space.

@@ -392,7 +392,33 @@ measure agreement with Torch, not accuracy against human transcripts.
 **BF16 does not provide exact Torch parity.** In this run, `tiny.en` inserts a comma after “belly” on LibriSpeech clip 2
 with timestamps; `tiny` inserts a comma after “you” on JFK without timestamps; and `tiny` changes “flower-fat and sauce”
 to “flower-fatten sauce” on LibriSpeech clip 1 with timestamps, also moving its closing timestamp from 10.16 to 10.12 s.
-FP16 matches all tested outputs; this is evidence for these fixtures, not a guarantee for every recording or accelerator.
+FP16 matches all tested tiny-model outputs; this is evidence for these fixtures, not a guarantee for every recording or accelerator.
+
+### Large-v3 measurements
+
+The [large-v3 report](benchmarks/reports/large_v3_audio_parity.json) uses the original OpenAI `large-v3` checkpoint and
+the same three recordings, with and without timestamps: **6 cases per dtype, 18 runs in total**. The environment and
+comparison method match the tiny-model measurements above. Torch retains FP16 computation and FP32 parameters;
+JAX uses FP32 parameters with each listed computation dtype. Encoding, cached decoding and full generation are explicitly
+JIT compiled. Each dtype was measured in a separate JAX-only CPU process.
+
+| JAX computation / parameters | Exact token sequences | Exact transcripts | Worst logit MAE | Maximum absolute logit error | Worst relative L2 logit error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FP32 / FP32 | 6/6 | 6/6 | 0.005298 | 0.037153 | 0.002382 |
+| FP16 / FP32 | 6/6 | 6/6 | 0.006737 | 0.042969 | 0.002142 |
+| BF16 / FP32 | **5/6** | **5/6** | 0.041154 | 0.265625 | 0.016600 |
+
+| JAX computation | Worst encoder MAE | Maximum absolute encoder error | Worst relative L2 encoder error |
+| --- | ---: | ---: | ---: |
+| FP32 | 0.002619 | 6.415212 | 0.020960 |
+| FP16 | 0.002609 | 2.779297 | 0.016796 |
+| BF16 | 0.015935 | 11.156250 | 0.072070 |
+
+The one BF16 transcript difference is on LibriSpeech clip 2 without timestamps: Torch produces “his belly counselled him”
+and JAX produces “his belly counseled him”. This spelling change corresponds to one word edit and three token edits;
+all three timestamped BF16 cases match exactly. FP32 and FP16 match every generated token in this matrix. These results
+do not establish exact BF16 parity on other recordings. Encoder representations have different scales across models,
+so compare their relative errors as well as their maximum absolute errors.
 
 ### Reproducing the tests
 
@@ -429,6 +455,28 @@ XLA_FLAGS=--xla_force_host_platform_device_count=2 PYTHONPATH=. \
 Add `--dtypes float32 float16 --strict-tokens` to make any token mismatch an error. Including BF16 with `--strict-tokens`
 currently exits nonzero. On accelerators use actual devices instead of the CPU `XLA_FLAGS` setting.
 
+For `large-v3`, use a separate reference directory and report. The generator reads the checkpoint's 128-bin Mel
+configuration and 100-language tokenizer rather than assuming the tiny models' settings:
+
+```sh
+# Torch reference environment
+PYTHONPATH=. python tests/fixtures/generate_real_whisper_reference.py \
+  --output /tmp/whisper-large-v3-parity --checkpoints large-v3 --uncompressed-params
+
+# JAX-only environment
+PYTHONPATH=. python benchmarks/check_real_audio_parity.py \
+  --reference-dir /tmp/whisper-large-v3-parity --report /tmp/large-v3-parity-report.json
+
+WHISPER_LARGE_V3_PARITY_DIR=/tmp/whisper-large-v3-parity PYTHONPATH=. \
+  python -m unittest discover -s tests -p test_large_v3_parity.py -v
+```
+
+The large-model suite is opt-in separately from the tiny-model suite. It covers all 18 audio/mode/dtype combinations,
+requires previously exact cases to remain exact, and bounds known token drift and per-case numerical error against the
+recorded results. It allows token differences to improve. Large-model runs need substantially more
+RAM and time; the checkpoint alone is approximately 3 GB, and its FP32 parameters occupy approximately 6 GB.
+`--uncompressed-params` saves those parameters without ZIP compression to accelerate export and subsequent loading.
+
 ### Compiled execution and memory review
 
 The report includes a complete encoder/decoder forward pass compiled with `pmap`, replicated FP32 weights and BF16
@@ -450,8 +498,9 @@ Forward temporary allocation is 138.82 MiB for a one-token `tiny.en` prompt and 
 These are XLA's executable memory estimates, not measured total process/device peak memory.
 
 CPU HLO expands BF16 arithmetic to FP32 and has many conversion operations; this cannot establish GPU kernel performance.
-The default attention path also materializes attention matrices. GPU cuDNN execution, accelerator memory/timing, and larger
-checkpoints remain unverified here. Dispatch/cache tests use an XLA stand-in for cuDNN. Further accelerator work should
+The default attention path also materializes attention matrices. GPU cuDNN execution and accelerator memory/timing remain
+unverified here. The HLO audit above covers the tiny models; the large-v3 measurements cover numerical and generation parity.
+Dispatch/cache tests use an XLA stand-in for cuDNN. Further accelerator work should
 measure cuDNN mask/layout costs and compare the existing one-hot cache writes against dynamic slice updates. Real-audio
 coverage here is greedy English single-window decoding; long-form stitching, language detection, translation, sampling and
 beam-search parity against native Torch are outside this measured matrix.
