@@ -87,6 +87,48 @@ FP16 and BF16 can choose different tokens. See the [measured generation parity](
 below. `dtype` controls computation and KV-cache storage; parameters retain their loaded dtype. The separate
 `shard_params()` API explicitly converts parameters to BF16.
 
+### Caching encoder projections in custom decoding loops
+
+Direct users of `FlaxWhisperForConditionalGeneration` (or `FlaxWhisperModel`) can precompute each decoder layer's
+encoder cross-attention keys and values with the actual model parameters:
+
+```python
+encoder_outputs = model.encode(features, params=params, return_dict=True)
+cross_cache = model.init_cross_attention_cache(encoder_outputs, params=params)
+cache = model.init_cache(batch_size, model.config.max_target_positions, encoder_outputs)
+
+# Inside the token loop:
+outputs = model.decode(
+    current_token_ids,
+    encoder_outputs,
+    decoder_attention_mask=attention_mask,
+    decoder_position_ids=position_ids,
+    past_key_values=cache,
+    cross_attention_cache=cross_cache,
+    params=params,
+    return_dict=True,
+)
+cache = outputs.past_key_values
+logits = outputs.logits[:, -1, :]
+```
+
+Call `init_cross_attention_cache` **outside** `jax.lax.while_loop`, inside the per-device function when using
+`shard_map`. It uses the existing projection weights and biases through Flax `apply`; it works with `_do_init=False`
+when `params` is supplied. `params` otherwise defaults to `model.params`.
+
+The result is a fixed tuple in decoder-layer order. Each layer contains `cached_key` and `cached_value` arrays shaped
+`[batch, source_length, heads, head_dim]` in the computation dtype. Pass the same cache on each step, either as an
+unchanged loop-carry value or a loop closure. `decode` reads it without running encoder K/V projections and returns only
+the updated self-attention `past_key_values`. Checkpoint parameter paths, attention backends and mask behavior are
+preserved. Omitting `cross_attention_cache` retains the existing uncached/teacher-forced path; `generate()` does not
+initialize this optional cache automatically.
+
+Rebuild the cross-attention cache whenever encoder outputs, parameters or computation dtype change. Any batch/beam
+expansion or reordering must also be applied to every cross-cache array on axis 0. FP16/BF16 storage costs
+`2 * decoder_layers * batch * source_length * d_model * 2` bytes: approximately **7.32 GiB per GPU** for large-v3 at
+batch 32 and 1,500 encoder positions. At those dimensions, reuse avoids about **10.07 TFLOP per token per GPU** in
+encoder K/V projections (counting a multiply-add as two FLOPs).
+
 ### Batching
 Whisper JAX also provides the option of _batching_ a single audio input across accelerator devices. The audio is first 
 chunked into 30 second segments, and then chunks dispatched to the model to be transcribed in parallel. The resulting 
@@ -441,7 +483,9 @@ XLA_FLAGS=--xla_force_host_platform_device_count=2 \
 Real-data tests skip explicitly when `WHISPER_REAL_PARITY_DIR` is absent. They require exact FP32/FP16 token parity and
 bound BF16 numerical error and each case's known token drift. New BF16 token differences fail for previously exact cases;
 improvements are allowed. Offline tests additionally compare original whisper-jax and Torch fixtures and exercise cache
-prefill/chunks, padding, beam-cache reordering, forced prompts, timestamps, and cuDNN dispatch. See
+prefill/chunks, padding, beam-cache reordering, forced prompts, timestamps, and cuDNN dispatch. Native cross-attention
+cache tests cover FP16/BF16 logits and self-attention cache parity, supplied parameters, attention masks, and fixed
+`while_loop` state. See
 [fixture provenance](tests/fixtures/README.md).
 
 To write a fresh numerical report and optimized HLO:
@@ -484,10 +528,26 @@ computation on two logical CPU devices. Different inputs on each replica match s
 exactly. HLO contains **zero all-reduce, all-gather, reduce-scatter, all-to-all or collective-permute operations**, and no
 host callbacks. Runtime model code uses native JAX/Flax; Torch is confined to reference-generation tooling.
 
-Complete generation has one XLA token loop. Its eight self-attention key/value buffers use BF16 and total 576 KiB per
-example at `max_length=96`. XLA hoists all eight cross-attention K/V projections outside that loop: they are computed once
-and reused, although the Python decoder expresses the projections on each call. A separately compiled standalone
-`decode()` call does not benefit from that cross-step hoisting.
+In that CPU audit, complete generation has one XLA token loop. Its eight self-attention key/value buffers use BF16 and
+total 576 KiB per example at `max_length=96`. XLA hoists all eight cross-attention K/V projections outside that loop.
+This is a compiler observation for that configuration, not a guarantee on CUDA or larger models. A separately compiled
+standalone `decode()` call does not benefit from cross-step hoisting. Custom loops can now explicitly initialize and
+pass `cross_attention_cache` as shown above, removing those projections from the decoder's traced computation.
+
+To inspect both pre-optimization and optimized CUDA HLO for the native cache at large-v3 dimensions, run:
+
+```sh
+PYTHONPATH=. python benchmarks/check_cross_attention_cache_hlo.py \
+  --platform gpu --attention-backend cudnn --dtype float16 \
+  --preset large-v3 --batch-size 32 --devices 8 \
+  --output-dir /tmp/whisper-cross-cache-fp16
+```
+
+Repeat with `--dtype bfloat16` and a different output directory. The script compiles abstract encoder outputs and FP32
+parameter inputs under `shard_map`, with replicated parameters and batch-sharded activations; it does not download
+weights or execute inference. It saves HLO and a JSON report and fails if cached encoder K/V projections remain inside
+the token loop, projection metadata cannot be accounted for, or collectives appear. The small CPU structural check is
+`PYTHONPATH=. python benchmarks/check_cross_attention_cache_hlo.py --platform cpu`. CPU HLO does not verify CUDA placement.
 
 The review replaced one-hot embedding matrix products with gathers, preserving padding and sharded-vocabulary semantics.
 This removes three embedding matrix products from the generation HLO, including a full-vocabulary operation per generated

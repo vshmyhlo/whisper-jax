@@ -191,6 +191,10 @@ WHISPER_DECODE_INPUTS_DOCSTRING = r"""
         past_key_values (`Dict[str, numpy.ndarray]`, *optional*, returned by `init_cache` or when passing previous `past_key_values`):
             Dictionary of pre-computed hidden-states (key and values in the attention blocks) that can be used for fast
             auto-regressive decoding. Pre-computed key and value hidden-states are of shape *[batch_size, max_length]*.
+        cross_attention_cache (`tuple[dict[str, jax.Array], ...]`, *optional*):
+            Read-only encoder key/value projections returned by `init_cross_attention_cache`. Initialize once with
+            the same encoder outputs and parameters used for decoding, outside the token loop. This cache is separate
+            from `past_key_values`, is never updated or returned by `decode`, and must be rebuilt when its inputs change.
         output_attentions (`bool`, *optional*):
             Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
             tensors for more detail.
@@ -366,22 +370,37 @@ class FlaxWhisperAttention(nn.Module):
         init_cache: bool = False,
         deterministic: bool = True,
         output_attentions: bool = True,
+        cross_attention_cache: Optional[dict] = None,
     ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
         is_cross_attention = key_value_states is not None
         batch_size = hidden_states.shape[0]
 
         query_states = self.q_proj(hidden_states)
 
-        if is_cross_attention:
-            key_states = self.k_proj(key_value_states)
-            value_states = self.v_proj(key_value_states)
+        if cross_attention_cache is not None:
+            if not is_cross_attention or self.causal:
+                raise ValueError("`cross_attention_cache` can only be used with encoder cross-attention.")
+            if set(cross_attention_cache) != {"cached_key", "cached_value"}:
+                raise ValueError("Each cross-attention cache layer must contain `cached_key` and `cached_value`.")
+            expected_shape = (batch_size, key_value_states.shape[1], self.num_heads, self.head_dim)
+            for name in ("cached_key", "cached_value"):
+                cached = cross_attention_cache[name]
+                if cached.shape != expected_shape:
+                    raise ValueError(f"Cross-attention {name} must have shape {expected_shape}, got {cached.shape}.")
+                if self.dtype is not None and cached.dtype != jnp.dtype(self.dtype):
+                    raise ValueError(
+                        f"Cross-attention {name} must have dtype {jnp.dtype(self.dtype)}, got {cached.dtype}."
+                    )
+            key_states = cross_attention_cache["cached_key"]
+            value_states = cross_attention_cache["cached_value"]
+        elif is_cross_attention:
+            projections = self.init_cross_attention_cache(key_value_states)
+            key_states, value_states = projections["cached_key"], projections["cached_value"]
         else:
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            key_states = self._split_heads(self.k_proj(hidden_states))
+            value_states = self._split_heads(self.v_proj(hidden_states))
 
         query_states = self._split_heads(query_states)
-        key_states = self._split_heads(key_states)
-        value_states = self._split_heads(value_states)
 
         query_states = with_sharding_constraint(query_states, ("batch", "length", "heads", "kv"))
         key_states = with_sharding_constraint(key_states, ("batch", "length", "heads", "kv"))
@@ -469,6 +488,13 @@ class FlaxWhisperAttention(nn.Module):
         attn_output = self.out_proj(attn_output)
 
         return attn_output, attn_weights
+
+    def init_cross_attention_cache(self, encoder_hidden_states: jnp.ndarray) -> dict:
+        # Use the existing DenseGeneral modules to preserve parameter paths, projection bias and compute dtype.
+        return {
+            "cached_key": self._split_heads(self.k_proj(encoder_hidden_states)),
+            "cached_value": self._split_heads(self.v_proj(encoder_hidden_states)),
+        }
 
     def _split_heads(self, hidden_state) -> jnp.ndarray:
         return hidden_state.reshape(hidden_state.shape[:2] + (self.num_heads, self.head_dim))
@@ -748,6 +774,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
         init_cache: bool = False,
         output_attentions: bool = True,
         deterministic: bool = True,
+        cross_attention_cache: Optional[dict] = None,
     ) -> Tuple[jnp.ndarray]:
         hidden_states = with_sharding_constraint(hidden_states, ("batch", "length", "embed"))
 
@@ -784,6 +811,7 @@ class FlaxWhisperDecoderLayer(nn.Module):
                 attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
                 deterministic=deterministic,
+                cross_attention_cache=cross_attention_cache,
             )
             cross_attn_output = self.dropout_layer(cross_attn_output, deterministic=deterministic)
             cross_attn_output = residual + cross_attn_output
@@ -843,13 +871,18 @@ class FlaxWhisperDecoderLayerCollection(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        cross_attention_cache: Optional[Tuple[dict, ...]] = None,
     ):
+        if cross_attention_cache is not None and len(cross_attention_cache) != len(self.layers):
+            raise ValueError(
+                f"`cross_attention_cache` must contain {len(self.layers)} layers, got {len(cross_attention_cache)}."
+            )
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_cross_attentions = () if (output_attentions and encoder_hidden_states is not None) else None
 
-        for decoder_layer in self.layers:
+        for layer_index, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
                 # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
@@ -865,6 +898,9 @@ class FlaxWhisperDecoderLayerCollection(nn.Module):
                     init_cache=init_cache,
                     output_attentions=output_attentions,
                     deterministic=deterministic,
+                    cross_attention_cache=(
+                        cross_attention_cache[layer_index] if cross_attention_cache is not None else None
+                    ),
                 )
 
             hidden_states = layer_outputs[0]
@@ -1033,6 +1069,7 @@ class FlaxWhisperDecoder(nn.Module):
         output_hidden_states: bool = False,
         return_dict: bool = True,
         deterministic: bool = True,
+        cross_attention_cache: Optional[Tuple[dict, ...]] = None,
     ) -> Tuple[jnp.ndarray]:
         input_embeds = self.embed_tokens(input_ids)
         position_embeds = self.embed_positions(position_ids)
@@ -1049,6 +1086,7 @@ class FlaxWhisperDecoder(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cross_attention_cache=cross_attention_cache,
         )
 
         last_hidden_states = outputs[0]
@@ -1205,6 +1243,44 @@ class FlaxWhisperPreTrainedModel(FlaxPreTrainedModel):
         else:
             return random_params
 
+    def init_cross_attention_cache(self, encoder_outputs, params: dict = None) -> Tuple[dict, ...]:
+        """Project the fixed encoder states once for use by :meth:`decode`.
+
+        Args:
+            encoder_outputs: Output of :meth:`encode` (a model output or tuple), whose first element has shape
+                ``(batch_size, source_length, config.d_model)``.
+            params: Model parameters used for the projections. Defaults to ``self.params``; required when the model
+                was constructed with ``_do_init=False``. Use the same parameters for encoding and decoding.
+
+        Returns:
+            A tuple in decoder-layer order, each entry a dictionary with ``cached_key`` and ``cached_value`` arrays
+            of shape ``(batch_size, source_length, decoder_attention_heads, head_dim)`` in the model's compute dtype.
+            The tree is fully initialized and has a fixed structure suitable for ``jax.jit`` and ``jax.lax.while_loop``.
+
+        Call this outside the decoding loop with the actual parameters; ``init_cache`` only initializes the separate
+        self-attention cache. Pass the result as ``cross_attention_cache`` to every ``decode`` call. It is read-only,
+        does not modify model parameters or ``past_key_values``, and must be rebuilt for new encoder states or weights.
+        Batch expansion/reordering (for example, beams) must also be applied to these arrays on axis 0.
+        """
+        encoder_hidden_states = encoder_outputs[0]
+        if encoder_hidden_states.ndim != 3 or encoder_hidden_states.shape[-1] != self.config.d_model:
+            raise ValueError(
+                "`encoder_outputs[0]` must have shape (batch_size, source_length, "
+                f"{self.config.d_model}), got {encoder_hidden_states.shape}."
+            )
+
+        def _project(module, hidden_states):
+            projections = []
+            for layer_index, layer in enumerate(module._get_decoder_module().layers.layers):
+                # Keep layer identity visible in HLO when called outside the decoder's forward scope.
+                with jax.named_scope(f"layers/{layer_index}/encoder_attn"):
+                    projections.append(layer.encoder_attn.init_cross_attention_cache(hidden_states))
+            return tuple(projections)
+
+        return self.module.apply(
+            {"params": self.params if params is None else params}, encoder_hidden_states, method=_project
+        )
+
     # Copied from transformers.models.bart.modeling_flax_bart.FlaxBartPreTrainedModel.init_cache with Bart->Whisper
     def init_cache(self, batch_size, max_length, encoder_outputs):
         r"""
@@ -1324,6 +1400,7 @@ class FlaxWhisperPreTrainedModel(FlaxPreTrainedModel):
         train: bool = False,
         params: dict = None,
         dropout_rng: PRNGKey = None,
+        cross_attention_cache: Optional[Tuple[dict, ...]] = None,
     ):
         r"""
         Returns:
@@ -1410,6 +1487,7 @@ class FlaxWhisperPreTrainedModel(FlaxPreTrainedModel):
             decoder_attention_mask=jnp.array(decoder_attention_mask, dtype="i4"),
             decoder_position_ids=jnp.array(decoder_position_ids, dtype="i4"),
             encoder_hidden_states=encoder_hidden_states,
+            cross_attention_cache=cross_attention_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -1591,6 +1669,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
         train: bool = False,
         params: dict = None,
         dropout_rng: PRNGKey = None,
+        cross_attention_cache: Optional[Tuple[dict, ...]] = None,
     ):
         r"""
         Returns:
@@ -1684,6 +1763,7 @@ class FlaxWhisperForConditionalGeneration(FlaxWhisperPreTrainedModel):
             decoder_attention_mask=jnp.array(decoder_attention_mask, dtype="i4"),
             decoder_position_ids=jnp.array(decoder_position_ids, dtype="i4"),
             encoder_hidden_states=encoder_hidden_states,
+            cross_attention_cache=cross_attention_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
