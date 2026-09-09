@@ -73,17 +73,22 @@ def summarize_hlo(hlo):
         }
 
     token_loop_bodies = set()
+    token_loop_conditions = set()
     for lines in computations.values():
         for line in lines:
             if re.search(r"\bwhile\(", line) and "decoder_token_loop" in line:
                 body = re.search(r"\bbody=%?([\w.-]+)", line)
+                condition = re.search(r"\bcondition=%?([\w.-]+)", line)
                 if body:
                     token_loop_bodies.add(body.group(1))
+                if condition:
+                    token_loop_conditions.add(condition.group(1))
     if not token_loop_bodies:
         raise ValueError("Could not identify the decoder token while_loop; inspect the saved HLO manually.")
 
     inside_loop = set()
-    pending = list(token_loop_bodies)
+    # Conditions also execute on every iteration and may call fused computations.
+    pending = list(token_loop_bodies | token_loop_conditions)
     while pending:
         name = pending.pop()
         if name not in inside_loop:
@@ -115,6 +120,7 @@ def summarize_hlo(hlo):
                     collectives[operation] = collectives.get(operation, 0) + 1
     return {
         "token_loop_bodies": sorted(token_loop_bodies),
+        "token_loop_conditions": sorted(token_loop_conditions),
         "cross_attention_kv_projections": projections,
         "projection_counts": {location: len(values) for location, values in projections.items()},
         "collectives": collectives,

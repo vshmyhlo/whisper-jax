@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import unfreeze
+from flax.traverse_util import flatten_dict, unflatten_dict
 from transformers import WhisperConfig
 
 from whisper_jax.modeling_flax_whisper import (
@@ -16,6 +17,17 @@ from whisper_jax.modeling_flax_whisper import (
     FlaxWhisperForConditionalGeneration,
     FlaxWhisperModel,
 )
+
+
+def nonzero_dense_parameters(params, seed):
+    """Replace the repository's zero-initialized dense kernels with useful test weights."""
+    generator = np.random.default_rng(seed)
+    flattened = flatten_dict(unfreeze(params))
+    for path, value in flattened.items():
+        if path[-1] == "kernel" and value.ndim == 2:
+            values = generator.normal(scale=0.5 / np.sqrt(value.shape[0]), size=value.shape)
+            flattened[path] = jnp.asarray(values, dtype=value.dtype)
+    return unflatten_dict(flattened)
 
 
 class CrossAttentionCacheTest(unittest.TestCase):
@@ -41,7 +53,7 @@ class CrossAttentionCacheTest(unittest.TestCase):
             attention_dropout=0.0,
         )
         initialized = FlaxWhisperForConditionalGeneration(cls.config, seed=17)
-        cls.params = unfreeze(initialized.params)
+        cls.params = nonzero_dense_parameters(initialized.params, seed=31)
         # Exercise projection biases and supplied parameters distinct from init_cache's dummy parameters.
         for index in range(cls.config.decoder_layers):
             attention_params = cls.params["model"]["decoder"]["layers"][str(index)]["encoder_attn"]
@@ -122,6 +134,39 @@ class CrossAttentionCacheTest(unittest.TestCase):
                         self.assert_tree_close(layer[name], expected.reshape(2, 4, 2, 4))
                 self.assertEqual(jax.tree_util.tree_structure(self.params), params_structure)
                 self.assert_tree_equal(cache, model.init_cross_attention_cache((encoder[0],), params=self.params))
+                changed_encoder = (encoder[0].at[:, 0, :].add(jnp.asarray(1, dtype=dtype)),)
+                changed_cache = model.init_cross_attention_cache(changed_encoder, params=self.params)
+                for layer, changed_layer in zip(cache, changed_cache):
+                    for name in ("cached_key", "cached_value"):
+                        self.assertFalse(np.array_equal(layer[name], changed_layer[name]))
+
+    def test_logits_and_later_self_cache_depend_on_cached_keys_and_values(self):
+        for dtype in (jnp.float16, jnp.bfloat16):
+            with self.subTest(dtype=dtype):
+                model = self._model(dtype)
+                encoder = model.encode(self.features, params=self.params)
+                cross_cache = model.init_cross_attention_cache(encoder, params=self.params)
+                self_cache = model.init_cache(2, 6, encoder)
+                kwargs = {
+                    "decoder_attention_mask": self.mask,
+                    "decoder_position_ids": jnp.array([[0, 1]], dtype=jnp.int32),
+                    "past_key_values": self_cache,
+                    "params": self.params,
+                    "return_dict": True,
+                }
+                expected = model.decode(self.ids[:, :2], encoder, cross_attention_cache=cross_cache, **kwargs)
+                for name in ("cached_key", "cached_value"):
+                    with self.subTest(cache_entry=name):
+                        # Change the first layer only: its encoder attention must affect the next layer's self K/V.
+                        corrupted = ({**cross_cache[0], name: jnp.zeros_like(cross_cache[0][name])},) + cross_cache[1:]
+                        actual = model.decode(self.ids[:, :2], encoder, cross_attention_cache=corrupted, **kwargs)
+                        logits_delta = jnp.max(jnp.abs(actual.logits.astype(jnp.float32) - expected.logits))
+                        self.assertGreater(float(logits_delta), 1e-3)
+                        later_expected = expected.past_key_values["model"]["decoder"]["layers"]["1"]["self_attn"]
+                        later_actual = actual.past_key_values["model"]["decoder"]["layers"]["1"]["self_attn"]
+                        for entry in ("cached_key", "cached_value"):
+                            delta = jnp.max(jnp.abs(later_actual[entry].astype(jnp.float32) - later_expected[entry]))
+                            self.assertGreater(float(delta), 1e-3)
 
     def test_cached_logits_and_self_cache_match_uncached_fp16_bf16(self):
         for dtype in (jnp.float16, jnp.bfloat16):
@@ -209,6 +254,7 @@ class CrossAttentionCacheTest(unittest.TestCase):
                 encoder = jax.random.normal(jax.random.PRNGKey(3), (2, 4, 8)).astype(dtype)
                 mask = jnp.array([[1, 1, 0, 0], [0, 1, 1, 0]])
                 variables = attention.init(jax.random.PRNGKey(4), hidden, key_value_states=encoder)
+                variables = {**variables, "params": nonzero_dense_parameters(variables["params"], seed=41)}
                 cache = attention.apply(variables, encoder, method=attention.init_cross_attention_cache)
                 expected = attention.apply(variables, hidden, key_value_states=encoder, attention_mask=mask)
                 actual = attention.apply(
@@ -279,6 +325,7 @@ class CrossAttentionCacheTest(unittest.TestCase):
         for model_class in (FlaxWhisperForConditionalGeneration, FlaxWhisperModel):
             with self.subTest(model_class=model_class):
                 model = model_class(self.config, seed=19)
+                model.params = nonzero_dense_parameters(model.params, seed=43)
                 cross_cache = model.init_cross_attention_cache(encoder)
                 self.assert_tree_equal(cross_cache, model.init_cross_attention_cache(encoder, params=model.params))
                 self_cache = model.init_cache(2, 6, encoder)
